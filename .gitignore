@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Streamlit
+# Ignora tudo em .streamlit, mas permite arquivos de exemplo
+.streamlit/*
+!.streamlit/
+!.streamlit/secrets.toml.example
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Arquivos temporários
+*.tmp
+*.bak
+
+# Dados sensíveis - NUNCA commitar dados reais!
+*.csv
+*.xlsx
+*.xls
+*.xlsm
+
+# Exceção: apenas arquivos de exemplo/template
+!*_exemplo.csv
+!*_template.csv
+!*_sample.csv
+
+# Ngrok
+ngrok.exe
+ngrok
+
+# Pastas de dados locais
+# Dados agora vêm do Google Sheets (configurado via Streamlit Secrets)
+dados/*.csv
+dados/*.xlsx
+
+# Scripts locais - não commitar scripts de automação
+*.bat
+*.ps1
+
