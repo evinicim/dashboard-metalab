@@ -895,6 +895,9 @@ def fazer_pivot_avaliacoes(_avaliacoes):
 # Pré-processar dados uma vez (com cache, sem spinner)
 inscricoes_originais, alunos_originais = preprocessar_dados(inscricoes, avaliacoes, alunos)
 
+# Manter uma cópia do DataFrame original de avaliações ANTES do pivot para contar todas as respostas
+avaliacoes_originais_long = avaliacoes.copy() if avaliacoes is not None else None
+
 # Fazer pivot das avaliações ANTES dos filtros
 avaliacoes_pivotadas = fazer_pivot_avaliacoes(avaliacoes)
 
@@ -1807,6 +1810,83 @@ def criar_grafico_raca(_alunos):
     fig.update_traces(hovertemplate="Raça/Cor: %{y}<br>Quantidade: %{x}<extra></extra>")
     return aplicar_tema_escuro(fig)
 
+def contar_respostas_avaliacao(pergunta_texto, avaliacoes_pivot, avaliacoes_long=None):
+    """
+    Conta todas as respostas de uma pergunta, usando o DataFrame original (long) se disponível,
+    ou o DataFrame pivotado como fallback.
+    
+    Args:
+        pergunta_texto: Texto da pergunta para buscar
+        avaliacoes_pivot: DataFrame pivotado (formato largo)
+        avaliacoes_long: DataFrame original (formato longo) - opcional
+    
+    Returns:
+        Series com value_counts das respostas normalizadas
+    """
+    # Se temos o DataFrame original (long), contar diretamente dele
+    if avaliacoes_long is not None and len(avaliacoes_long) > 0:
+        # Verificar se está em formato longo (tem coluna 'Pergunta')
+        colunas_lower = [str(col).lower() for col in avaliacoes_long.columns]
+        if 'pergunta' in colunas_lower:
+            # Encontrar coluna de pergunta
+            coluna_pergunta = None
+            for col in avaliacoes_long.columns:
+                if 'pergunta' in str(col).lower():
+                    coluna_pergunta = col
+                    break
+            
+            # Encontrar coluna de valor (Nome exibido ou Resposta de texto livre)
+            valor_col = None
+            for col in avaliacoes_long.columns:
+                col_lower = str(col).lower()
+                if 'nome exibido' in col_lower:
+                    valor_col = col
+                    break
+                elif 'resposta de texto livre' in col_lower:
+                    if avaliacoes_long[col].notna().sum() > len(avaliacoes_long) * 0.1:
+                        valor_col = col
+                        break
+            
+            if coluna_pergunta and valor_col:
+                # Filtrar pela pergunta específica
+                # Extrair palavras-chave do texto da pergunta
+                palavras_chave = [p for p in pergunta_texto.lower().split() if len(p) > 3]  # Palavras com mais de 3 caracteres
+                
+                # Buscar perguntas que contenham pelo menos uma palavra-chave importante
+                mask_pergunta = pd.Series([False] * len(avaliacoes_long))
+                perguntas_unicas = avaliacoes_long[coluna_pergunta].unique()
+                
+                for pergunta in perguntas_unicas:
+                    pergunta_lower = str(pergunta).lower()
+                    # Verificar se a pergunta contém palavras-chave importantes
+                    palavras_encontradas = sum(1 for palavra in palavras_chave if palavra in pergunta_lower)
+                    # Ou verificar se o texto completo está contido
+                    if pergunta_texto.lower() in pergunta_lower or palavras_encontradas >= min(2, len(palavras_chave)):
+                        mask_pergunta |= (avaliacoes_long[coluna_pergunta] == pergunta)
+                
+                if mask_pergunta.any():
+                    # Obter todas as respostas para essa pergunta
+                    respostas = avaliacoes_long.loc[mask_pergunta, valor_col].dropna()
+                    
+                    if len(respostas) > 0:
+                        # Normalizar respostas
+                        respostas_normalizadas = respostas.apply(normalizar_resposta_avaliacao)
+                        respostas_validas = respostas_normalizadas[respostas_normalizadas.notna()]
+                        return respostas_validas.value_counts()
+    
+    # Fallback: usar DataFrame pivotado
+    if avaliacoes_pivot is not None and len(avaliacoes_pivot) > 0:
+        # Buscar coluna que corresponde à pergunta
+        for col in avaliacoes_pivot.columns:
+            if pergunta_texto.lower() in str(col).lower():
+                respostas = avaliacoes_pivot[col].dropna()
+                if len(respostas) > 0:
+                    respostas_normalizadas = respostas.apply(normalizar_resposta_avaliacao)
+                    respostas_validas = respostas_normalizadas[respostas_normalizadas.notna()]
+                    return respostas_validas.value_counts()
+    
+    return pd.Series(dtype=int)
+
 def remover_acentos(texto):
     """Remove acentos de um texto de forma robusta"""
     if pd.isna(texto):
@@ -1828,6 +1908,76 @@ def remover_acentos(texto):
     for acento, sem_acento in acentos.items():
         resultado = resultado.replace(acento, sem_acento)
     return resultado
+
+def normalizar_resposta_avaliacao(valor):
+    """Normaliza respostas de avaliações para agrupar variações similares"""
+    if pd.isna(valor) or valor == '':
+        return None
+    
+    # Converter para string e normalizar
+    valor_str = str(valor).strip()
+    
+    if not valor_str:
+        return None
+    
+    # Remover acentos e converter para minúsculas
+    valor_normalizado = remover_acentos(valor_str.lower())
+    
+    # Normalizar espaços múltiplos
+    valor_normalizado = re.sub(r'\s+', ' ', valor_normalizado).strip()
+    
+    # Mapear variações comuns para valores padronizados (ordem importa - mais específico primeiro)
+    mapeamento_especifico = [
+        ('superou as expectativas', 'Sim'),
+        ('ficou abaixo das expectativas', 'Não'),
+        ('atendeu completamente', 'Sim'),
+        ('atendeu parcialmente', 'Parcialmente'),
+        ('nao atendeu', 'Não'),
+        ('sim, indicaria', 'Sim'),
+        ('nao indicaria', 'Não'),
+        ('sim, com certeza', 'Sim'),
+        ('com certeza', 'Sim'),
+        ('definitivamente', 'Sim'),
+        ('nao tenho certeza', 'Talvez'),
+        ('pode ser', 'Talvez'),
+        ('provavelmente', 'Talvez'),
+        ('muito ruim', 'Ruim'),
+        ('muito bom', 'Ótimo'),
+    ]
+    
+    # Verificar correspondências específicas primeiro
+    for chave, valor_padrao in mapeamento_especifico:
+        if chave in valor_normalizado:
+            return valor_padrao
+    
+    # Mapeamento simples (exato ou início da palavra)
+    mapeamento_simples = {
+        'otimo': 'Ótimo',
+        'excelente': 'Ótimo',
+        'bom': 'Bom',
+        'regular': 'Regular',
+        'ruim': 'Ruim',
+        'pessimo': 'Ruim',
+        'sim': 'Sim',
+        'nao': 'Não',
+        'talvez': 'Talvez',
+        'atendeu': 'Sim',
+        'superou': 'Sim',
+        'ficou abaixo': 'Não',
+    }
+    
+    # Verificar correspondências simples (palavra completa ou início)
+    for chave, valor_padrao in mapeamento_simples.items():
+        if valor_normalizado == chave or valor_normalizado.startswith(chave + ' ') or valor_normalizado.endswith(' ' + chave):
+            return valor_padrao
+    
+    # Se não encontrou correspondência, capitalizar primeira letra de cada palavra
+    palavras = valor_normalizado.split()
+    if palavras:
+        resultado = ' '.join(palavra.capitalize() for palavra in palavras)
+        return resultado
+    
+    return valor_str  # Retornar original se não conseguir normalizar
 
 def normalizar_categoria_renda(valor):
     """Normaliza e padroniza categorias de renda para agrupar duplicatas de forma robusta"""
@@ -2266,15 +2416,33 @@ with col1:
     
     if coluna_avaliacao_curso:
         try:
-            avaliacao_curso = avaliacoes[coluna_avaliacao_curso].dropna().value_counts()
+            # Contar todas as respostas do DataFrame original (formato longo) se disponível
+            avaliacao_curso = contar_respostas_avaliacao(coluna_avaliacao_curso, avaliacoes, avaliacoes_originais_long)
+            
             if len(avaliacao_curso) > 0:
+                # Total é a soma de todas as contagens
+                total_respostas = avaliacao_curso.sum()
                 fig_av_curso = px.bar(
                     x=avaliacao_curso.index,
                     y=avaliacao_curso.values,
-                    title="Avaliação Geral do Curso",
-                    labels={'x': 'Avaliação', 'y': 'Quantidade'},
+                    title=f"Avaliação Geral do Curso (Total: {total_respostas} respostas)",
+                    labels={'x': 'Avaliação', 'y': 'Quantidade de Respostas'},
                     color=avaliacao_curso.values,
-                    color_continuous_scale=['#c62828', '#ef5350', '#ffa726', '#66bb6a', '#2e7d32']
+                    color_continuous_scale=['#c62828', '#ef5350', '#ffa726', '#66bb6a', '#2e7d32'],
+                    text=avaliacao_curso.values
+                )
+                fig_av_curso.update_traces(
+                    texttemplate='%{text} respostas<br>(%{customdata:.1f}%)',
+                    textposition='outside',
+                    textfont=dict(size=14),
+                    hovertemplate='<b>%{x}</b><br>Quantidade: %{y} respostas<br>Percentual: %{customdata:.1f}%<extra></extra>',
+                    customdata=(avaliacao_curso.values / total_respostas * 100)
+                )
+                fig_av_curso.update_layout(
+                    title_font_size=18,
+                    xaxis_title_font_size=14,
+                    yaxis_title_font_size=14,
+                    font=dict(size=13)
                 )
                 fig_av_curso = aplicar_tema_escuro(fig_av_curso)
                 st.plotly_chart(fig_av_curso, use_container_width=True)
@@ -2308,15 +2476,32 @@ with col1:
     
     if coluna_avaliacao_prof:
         try:
-            avaliacao_prof = avaliacoes[coluna_avaliacao_prof].dropna().value_counts()
+            # Contar todas as respostas do DataFrame original (formato longo) se disponível
+            avaliacao_prof = contar_respostas_avaliacao(coluna_avaliacao_prof, avaliacoes, avaliacoes_originais_long)
+            
             if len(avaliacao_prof) > 0:
+                total_respostas = avaliacao_prof.sum()
                 fig_av_prof = px.bar(
                     x=avaliacao_prof.index,
                     y=avaliacao_prof.values,
-                    title="Avaliação do Professor",
-                    labels={'x': 'Avaliação', 'y': 'Quantidade'},
+                    title=f"Avaliação do Professor (Total: {total_respostas} respostas)",
+                    labels={'x': 'Avaliação', 'y': 'Quantidade de Respostas'},
                     color=avaliacao_prof.values,
-                    color_continuous_scale=['#1a237e', '#3949ab', '#5c6bc0', '#7986cb', '#90caf9']
+                    color_continuous_scale=['#1a237e', '#3949ab', '#5c6bc0', '#7986cb', '#90caf9'],
+                    text=avaliacao_prof.values
+                )
+                fig_av_prof.update_traces(
+                    texttemplate='%{text} respostas<br>(%{customdata:.1f}%)',
+                    textposition='outside',
+                    textfont=dict(size=14),
+                    hovertemplate='<b>%{x}</b><br>Quantidade: %{y} respostas<br>Percentual: %{customdata:.1f}%<extra></extra>',
+                    customdata=(avaliacao_prof.values / total_respostas * 100)
+                )
+                fig_av_prof.update_layout(
+                    title_font_size=18,
+                    xaxis_title_font_size=14,
+                    yaxis_title_font_size=14,
+                    font=dict(size=13)
                 )
                 fig_av_prof = aplicar_tema_escuro(fig_av_prof)
                 st.plotly_chart(fig_av_prof, use_container_width=True)
@@ -2334,28 +2519,52 @@ with col1:
 
 with col2:
     # Satisfação com Espaço Físico
-    if 'No que se refere ao espaço físico (Laboratório de Informática), qual seu nível de satisfação?' in avaliacoes.columns:
-        satisfacao_espaco = avaliacoes['No que se refere ao espaço físico (Laboratório de Informática), qual seu nível de satisfação?'].value_counts()
+    pergunta_espaco = 'No que se refere ao espaço físico (Laboratório de Informática), qual seu nível de satisfação?'
+    if pergunta_espaco in avaliacoes.columns:
+        satisfacao_espaco = contar_respostas_avaliacao(pergunta_espaco, avaliacoes, avaliacoes_originais_long)
+        total_respostas = satisfacao_espaco.sum() if len(satisfacao_espaco) > 0 else 0
         fig_sat_espaco = px.pie(
             values=satisfacao_espaco.values,
             names=satisfacao_espaco.index,
-            title="Satisfação com Espaço Físico",
+            title=f"Satisfação com Espaço Físico (Total: {total_respostas} respostas)",
             color_discrete_sequence=PALETA_METALAB
         )
-        fig_sat_espaco.update_traces(textposition='inside', textinfo='percent+label', textfont=dict(color='white'))
+        fig_sat_espaco.update_traces(
+            textposition='inside',
+            textinfo='label+value+percent',
+            texttemplate='%{label}<br>%{value} respostas<br>(%{percent})',
+            textfont=dict(color='white', size=13),
+            hovertemplate='<b>%{label}</b><br>Quantidade: %{value} respostas<br>Percentual: %{percent}<extra></extra>'
+        )
+        fig_sat_espaco.update_layout(
+            title_font_size=18,
+            font=dict(size=13)
+        )
         fig_sat_espaco = aplicar_tema_escuro(fig_sat_espaco)
         st.plotly_chart(fig_sat_espaco, use_container_width=True)
     
     # Satisfação com Instalações
-    if 'Avalie seu nível de satisfação em relação as demais instalações da ONG (hall de entrada, banheiro, recepção, auditório):' in avaliacoes.columns:
-        satisfacao_inst = avaliacoes['Avalie seu nível de satisfação em relação as demais instalações da ONG (hall de entrada, banheiro, recepção, auditório):'].value_counts()
+    pergunta_inst = 'Avalie seu nível de satisfação em relação as demais instalações da ONG (hall de entrada, banheiro, recepção, auditório):'
+    if pergunta_inst in avaliacoes.columns:
+        satisfacao_inst = contar_respostas_avaliacao(pergunta_inst, avaliacoes, avaliacoes_originais_long)
+        total_respostas = satisfacao_inst.sum() if len(satisfacao_inst) > 0 else 0
         fig_sat_inst = px.pie(
             values=satisfacao_inst.values,
             names=satisfacao_inst.index,
-            title="Satisfação com Instalações",
+            title=f"Satisfação com Instalações (Total: {total_respostas} respostas)",
             color_discrete_sequence=PALETA_METALAB
         )
-        fig_sat_inst.update_traces(textposition='inside', textinfo='percent+label', textfont=dict(color='white'))
+        fig_sat_inst.update_traces(
+            textposition='inside',
+            textinfo='label+value+percent',
+            texttemplate='%{label}<br>%{value} respostas<br>(%{percent})',
+            textfont=dict(color='white', size=13),
+            hovertemplate='<b>%{label}</b><br>Quantidade: %{value} respostas<br>Percentual: %{percent}<extra></extra>'
+        )
+        fig_sat_inst.update_layout(
+            title_font_size=18,
+            font=dict(size=13)
+        )
         fig_sat_inst = aplicar_tema_escuro(fig_sat_inst)
         st.plotly_chart(fig_sat_inst, use_container_width=True)
 
@@ -2369,15 +2578,34 @@ for col in avaliacoes.columns:
 
 if coluna_sabendo_curso:
     try:
-        sabendo_curso = avaliacoes[coluna_sabendo_curso].dropna().value_counts()
+        sabendo_curso = contar_respostas_avaliacao(coluna_sabendo_curso, avaliacoes, avaliacoes_originais_long)
         if len(sabendo_curso) > 0:
-            fig_sabendo = px.pie(
-                values=sabendo_curso.values,
-                names=sabendo_curso.index,
-                title="Como Ficou Sabendo do Curso?",
-                color_discrete_sequence=PALETA_METALAB
+            total_respostas = sabendo_curso.sum()
+            # Ordenar por quantidade (maior para menor)
+            sabendo_curso_ordenado = sabendo_curso.sort_values(ascending=True)
+            fig_sabendo = px.bar(
+                x=sabendo_curso_ordenado.values,
+                y=sabendo_curso_ordenado.index,
+                orientation='h',
+                title=f"Como Ficou Sabendo do Curso? (Total: {total_respostas} respostas)",
+                labels={'x': 'Quantidade de Respostas', 'y': 'Canal de Divulgação'},
+                color=sabendo_curso_ordenado.values,
+                color_continuous_scale=['#1a237e', '#3949ab', '#5c6bc0', '#7986cb', '#90caf9', '#b3d9ff'],
+                text=sabendo_curso_ordenado.values
             )
-            fig_sabendo.update_traces(textposition='inside', textinfo='percent+label', textfont=dict(color='white'))
+            fig_sabendo.update_traces(
+                texttemplate='%{text} respostas<br>(%{customdata:.1f}%)',
+                textposition='outside',
+                textfont=dict(size=14),
+                hovertemplate='<b>%{y}</b><br>Quantidade: %{x} respostas<br>Percentual: %{customdata:.1f}%<extra></extra>',
+                customdata=(sabendo_curso_ordenado.values / total_respostas * 100)
+            )
+            fig_sabendo.update_layout(
+                title_font_size=18,
+                xaxis_title_font_size=14,
+                yaxis_title_font_size=14,
+                font=dict(size=13)
+            )
             fig_sabendo = aplicar_tema_escuro(fig_sabendo)
             st.plotly_chart(fig_sabendo, use_container_width=True)
     except Exception as e:
@@ -2398,15 +2626,30 @@ with col1:
     
     if coluna_expectativas:
         try:
-            expectativas = avaliacoes[coluna_expectativas].dropna().value_counts()
+            expectativas = contar_respostas_avaliacao(coluna_expectativas, avaliacoes, avaliacoes_originais_long)
             if len(expectativas) > 0:
+                total_respostas = expectativas.sum()
                 fig_expectativas = px.bar(
                     x=expectativas.index,
                     y=expectativas.values,
-                    title="O Conteúdo Atendeu Minhas Expectativas?",
-                    labels={'x': 'Resposta', 'y': 'Quantidade'},
+                    title=f"O Conteúdo Atendeu Minhas Expectativas? (Total: {total_respostas} respostas)",
+                    labels={'x': 'Resposta', 'y': 'Quantidade de Respostas'},
                     color=expectativas.values,
-                    color_continuous_scale=['#c62828', '#ef5350', '#ffa726', '#66bb6a', '#2e7d32']
+                    color_continuous_scale=['#c62828', '#ef5350', '#ffa726', '#66bb6a', '#2e7d32'],
+                    text=expectativas.values
+                )
+                fig_expectativas.update_traces(
+                    texttemplate='%{text} respostas<br>(%{customdata:.1f}%)',
+                    textposition='outside',
+                    textfont=dict(size=14),
+                    hovertemplate='<b>%{x}</b><br>Quantidade: %{y} respostas<br>Percentual: %{customdata:.1f}%<extra></extra>',
+                    customdata=(expectativas.values / total_respostas * 100)
+                )
+                fig_expectativas.update_layout(
+                    title_font_size=18,
+                    xaxis_title_font_size=14,
+                    yaxis_title_font_size=14,
+                    font=dict(size=13)
                 )
                 fig_expectativas = aplicar_tema_escuro(fig_expectativas)
                 st.plotly_chart(fig_expectativas, use_container_width=True)
@@ -2424,15 +2667,34 @@ with col2:
     
     if coluna_indicacao:
         try:
-            indicacao = avaliacoes[coluna_indicacao].dropna().value_counts()
+            indicacao = contar_respostas_avaliacao(coluna_indicacao, avaliacoes, avaliacoes_originais_long)
             if len(indicacao) > 0:
-                fig_indicacao = px.pie(
-                    values=indicacao.values,
-                    names=indicacao.index,
-                    title="Você Indicaria o Curso para Familiares e Amigos?",
-                    color_discrete_sequence=[CORES_METALAB['success'], CORES_METALAB['warning'], CORES_METALAB['error']]
+                total_respostas = indicacao.sum()
+                # Ordenar por quantidade (maior para menor)
+                indicacao_ordenado = indicacao.sort_values(ascending=True)
+                fig_indicacao = px.bar(
+                    x=indicacao_ordenado.values,
+                    y=indicacao_ordenado.index,
+                    orientation='h',
+                    title=f"Você Indicaria o Curso para Familiares e Amigos? (Total: {total_respostas} respostas)",
+                    labels={'x': 'Quantidade de Respostas', 'y': 'Resposta'},
+                    color=indicacao_ordenado.values,
+                    color_continuous_scale=['#c62828', '#ef5350', '#ffa726', '#66bb6a', '#2e7d32'],
+                    text=indicacao_ordenado.values
                 )
-                fig_indicacao.update_traces(textposition='inside', textinfo='percent+label', textfont=dict(color='white'))
+                fig_indicacao.update_traces(
+                    texttemplate='%{text} respostas<br>(%{customdata:.1f}%)',
+                    textposition='outside',
+                    textfont=dict(size=14),
+                    hovertemplate='<b>%{y}</b><br>Quantidade: %{x} respostas<br>Percentual: %{customdata:.1f}%<extra></extra>',
+                    customdata=(indicacao_ordenado.values / total_respostas * 100)
+                )
+                fig_indicacao.update_layout(
+                    title_font_size=18,
+                    xaxis_title_font_size=14,
+                    yaxis_title_font_size=14,
+                    font=dict(size=13)
+                )
                 fig_indicacao = aplicar_tema_escuro(fig_indicacao)
                 st.plotly_chart(fig_indicacao, use_container_width=True)
         except Exception as e:
@@ -2453,15 +2715,30 @@ with col2:
     
     if coluna_suporte:
         try:
-            suporte_ped = avaliacoes[coluna_suporte].dropna().value_counts()
+            suporte_ped = contar_respostas_avaliacao(coluna_suporte, avaliacoes, avaliacoes_originais_long)
             if len(suporte_ped) > 0:
+                total_respostas = suporte_ped.sum()
                 fig_suporte = px.bar(
                     x=suporte_ped.index,
                     y=suporte_ped.values,
-                    title="Suporte da Coordenação Pedagógica",
-                    labels={'x': 'Resposta', 'y': 'Quantidade'},
+                    title=f"Suporte da Coordenação Pedagógica (Total: {total_respostas} respostas)",
+                    labels={'x': 'Resposta', 'y': 'Quantidade de Respostas'},
                     color=suporte_ped.values,
-                    color_continuous_scale=['#1a237e', '#3949ab', '#5c6bc0', '#7986cb', '#90caf9']
+                    color_continuous_scale=['#1a237e', '#3949ab', '#5c6bc0', '#7986cb', '#90caf9'],
+                    text=suporte_ped.values
+                )
+                fig_suporte.update_traces(
+                    texttemplate='%{text} respostas<br>(%{customdata:.1f}%)',
+                    textposition='outside',
+                    textfont=dict(size=14),
+                    hovertemplate='<b>%{x}</b><br>Quantidade: %{y} respostas<br>Percentual: %{customdata:.1f}%<extra></extra>',
+                    customdata=(suporte_ped.values / total_respostas * 100)
+                )
+                fig_suporte.update_layout(
+                    title_font_size=18,
+                    xaxis_title_font_size=14,
+                    yaxis_title_font_size=14,
+                    font=dict(size=13)
                 )
                 fig_suporte = aplicar_tema_escuro(fig_suporte)
                 st.plotly_chart(fig_suporte, use_container_width=True)
